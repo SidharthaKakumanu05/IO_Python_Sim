@@ -1,45 +1,62 @@
 import cupy as cp
 
-def update_pfpkj_plasticity(
-    w, pre_idx, post_idx,
-    pf_spikes, pkj_spikes, cf_mask,
-    t, cfg,
-    last_pf_spike, last_pkj_spike, last_cf_spike
-):
-    ltd_win = cp.float32(cfg["ltd_window"])
-    ltp_win = cp.float32(cfg["ltp_window"])
-    ltd_scale = cp.float32(cfg["ltd_scale"])
-    ltp_scale = cp.float32(cfg["ltp_scale"])
-    w_min = cp.float32(cfg["weight_min"])
-    w_max = cp.float32(cfg["weight_max"])
 
-    if pf_spikes.any():
-        last_pf_spike[pf_spikes] = t
-    if pkj_spikes.any():
-        last_pkj_spike[pkj_spikes] = t
-    if cf_mask.any():
-        cf_idx = cp.where(cf_mask)[0]
-        last_cf_spike[cf_idx] = t
+class PFPlasticity:
+    def __init__(self, pre_idx, post_idx, n_pre, pkj_per_io, weight_init, weight_min, weight_max,
+                 window_steps, ltd_steps, ltp_strength, ltd_strength):
+        self.pre_idx = pre_idx
+        self.post_idx = post_idx
+        self.pkj_per_io = pkj_per_io
 
-    dt_pf = t - last_pf_spike[pre_idx]
+        self.w = cp.full(pre_idx.size, weight_init, dtype=cp.float32)
+        self.weight_min = cp.float32(weight_min)
+        self.weight_max = cp.float32(weight_max)
+        self.ltp_strength = cp.float32(ltp_strength)
+        self.ltd_strength = cp.float32(ltd_strength)
 
-    if cf_mask.any():
-        posts_cf = cf_mask[post_idx]
-        # LTD condition: PF spiked within ltd_win BEFORE CF spike
-        # dt_pf > 0 means PF spiked before current time (which is when CF spikes)
-        ltd_mask = posts_cf & (dt_pf > 0) & (dt_pf <= ltd_win)
-        if ltd_mask.any():
-            w[ltd_mask] += ltd_scale  # ltd_scale is already negative (-0.00275)
+        self.window_steps = window_steps
+        self.ltd_steps = ltd_steps
+        self.big_buf = cp.zeros((window_steps, n_pre), dtype=cp.float32)
+        self.small_buf = cp.zeros((ltd_steps, n_pre), dtype=cp.float32)
+        self.big_ptr = 0
+        self.small_ptr = 0
+        self.total_count = cp.zeros(n_pre, dtype=cp.float32)
+        self.ltd_count = cp.zeros(n_pre, dtype=cp.float32)
+        self.pkj_block = self.post_idx // self.pkj_per_io
 
-    if pkj_spikes.any():
-        posts_spike_no_cf = pkj_spikes[post_idx] & ~cf_mask[post_idx]
-        
-        if posts_spike_no_cf.any():
-            # LTP condition: PF spiked within ltp_win BEFORE PKJ spike (without CF)
-            ltp_mask = posts_spike_no_cf & (dt_pf > 0) & (dt_pf <= ltp_win)
-            if ltp_mask.any():
-                w[ltp_mask] += ltp_scale
+    def step(self, pf_spike, io_spike):
+        big_row = self.big_buf[self.big_ptr]
+        small_row = self.small_buf[self.small_ptr]
 
-    w = cp.clip(w, w_min, w_max)
+        pf_f, self.total_count, self.ltd_count, ltp_count = _ring_update(
+            pf_spike, big_row, small_row, self.total_count, self.ltd_count,
+        )
 
-    return w, last_pf_spike, last_pkj_spike, last_cf_spike
+        self.big_buf[self.big_ptr] = pf_f
+        self.big_ptr = (self.big_ptr + 1) % self.window_steps
+        self.small_buf[self.small_ptr] = pf_f
+        self.small_ptr = (self.small_ptr + 1) % self.ltd_steps
+
+        cf_active = io_spike[self.pkj_block]
+
+        self.w = _plasticity_update(
+            self.w, self.ltp_strength, ltp_count[self.pre_idx],
+            self.ltd_strength, self.ltd_count[self.pre_idx], cf_active,
+            self.weight_min, self.weight_max,
+        )
+        return self.w
+
+
+@cp.fuse()
+def _ring_update(pf_spike, big_row, small_row, total_count, ltd_count):
+    pf_f = pf_spike.astype(cp.float32)
+    new_total = total_count + pf_f - big_row
+    new_ltd = ltd_count + pf_f - small_row
+    ltp_count = new_total - new_ltd
+    return pf_f, new_total, new_ltd, ltp_count
+
+
+@cp.fuse()
+def _plasticity_update(w, ltp_strength, ltp_count, ltd_strength, ltd_count, cf_active, weight_min, weight_max):
+    dw = (ltp_strength * ltp_count - ltd_strength * ltd_count) * cf_active
+    return cp.clip(w + dw, weight_min, weight_max)

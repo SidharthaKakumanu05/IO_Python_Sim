@@ -1,103 +1,103 @@
-# Project_1Hz: Cerebellar Microcircuit Simulation
+# Project_1Hz
 
-This project simulates a simplified cerebellar microcircuit using GPU-accelerated 
-Leaky Integrate-and-Fire (LIF) neurons, plastic synapses, and realistic connectivity. 
-The target behavior is that Inferior Olive (IO) neurons fire around 1 Hz as an 
-emergent property of the network dynamics.
+A GPU-accelerated (CuPy) spiking simulation of a minimal olivo-cerebellar loop —
+four small neuron populations wired into one feedback loop, plus a learning rule.
+This doc is meant to let someone with zero context on this repo understand what it
+does and find their way around the code.
 
-## 🧠 What This Simulates
+## The big picture
 
-The cerebellum is a brain region involved in motor learning and coordination. This 
-simulation models the key components:
+Four populations, wired one-way into a loop, with one learned connection:
 
-- **Inferior Olive (IO)**: Provides teaching signals (~1 Hz firing rate)
-- **Purkinje Cells (PKJ)**: Main computational units that learn from experience
-- **Basket Cells (BC)**: Inhibitory interneurons that regulate PKJ activity
-- **Deep Cerebellar Nuclei (DCN)**: Final output neurons
-- **Parallel Fibers (PF)**: Excitatory inputs from cortex
-- **Mossy Fibers (MF)**: Excitatory inputs from brainstem
-- **Climbing Fibers (CF)**: Teaching signals from IO
+```
+PF ──excitatory, plastic──▶ PKJ ──inhibitory──▶ DCN ──inhibitory──▶ IO ──inhibitory──▶ PKJ
+                                                                      IO ◀─gap junctions─▶ IO
+```
 
-## 🚦 Control Flow Overview
+- **PF** (parallel fibers, 4096 cells) — random background input, fires at a fixed rate. Nothing upstream of it.
+- **PKJ** (Purkinje cells, 128) — a standard leaky integrate-and-fire (LIF) neuron.
+- **DCN** (deep cerebellar nuclei, 8) — same LIF neuron, but with a constant bias current so it fires steadily unless suppressed.
+- **IO** (inferior olive, 16) — a pacemaker-style neuron with a threshold that jumps up after each spike and decays back down over time; also directly electrically coupled to other IO cells in pairs (gap junctions), independent of synapses.
 
-Below is the **big picture pipeline** of how the code runs:
+IO firing is the "teaching signal": every time an IO cell fires, it nudges the
+weights of the PF→PKJ synapses feeding the PKJ cells it's paired with. Everything
+else in the loop (PKJ→DCN, DCN→IO, IO→PKJ) is inhibitory and fixed-weight — only
+PF→PKJ learns.
 
-### 1. **Entry Point**
-   - `main.py`
-     - Checks for CUDA GPU availability
-     - Calls `simulate.run()` to execute the simulation
-     - After simulation completes, saves outputs to `cbm_py_output.npz`
+## Walking through the code
 
-### 2. **Simulation Loop**
-   - `simulate.py`
-     - Loads parameters from `config.py`
-     - Builds network wiring with `connectivity.py`
-     - Creates neuron populations using `neurons.py`
-     - Creates synapse objects using `synapses.py`
-     - Initializes inputs (PFs, MFs) with `inputs.py`
-     - Applies gap junctions with `coupling.py`
-     - Runs the timestep loop:
-       - Updates IO, PF, MF, BC, PKJ, DCN in sequence
-       - Applies synaptic currents and delays
-       - Applies PF→PKJ plasticity rules from `plasticity.py`
-       - Records spikes and weights using `recorder.py`
-     - Finishes by writing results to `.npz`
+Read the files in roughly this order to build up the full picture:
 
-### 3. **Analysis**
-   - `analysis.py`
-     - Loads the `.npz` file produced by simulation
-     - Generates publication-ready plots:
-       - IO raster with firing rates
-       - PKJ raster (first 200 neurons)
-       - PF raster (random subset)
-       - DCN raster with firing rates
-       - PKJ mean firing rate over time
-       - PF→PKJ weight traces (individual + mean ± std)
-       - Weight distribution analysis
-       - IO pair voltage traces (if available)
+1. **`config.py`** — every tunable number lives here: population sizes, timestep,
+   simulation length, all neuron/synapse parameters, plasticity settings. Start
+   here to see what's configurable before looking at any logic.
 
-## 📂 File-by-File Summary
+2. **`connectivity.py`** — builds the random wiring once at startup: which PF
+   cells connect to which PKJ cells, how PKJ cells group into DCN/IO targets,
+   and which IO cells are paired for gap junctions. Returns a dict of
+   `pre_idx`/`post_idx` index arrays that every other file consumes.
 
-- **`main.py`** → Entry point script, handles GPU check and simulation execution
-- **`simulate.py`** → Core simulation engine and main control loop
-- **`config.py`** → All simulation parameters (population sizes, neuron configs, synapses, plasticity)
-- **`connectivity.py`** → Builds wiring diagrams between neuron populations
-- **`neurons.py`** → Defines `NeuronState` class and LIF update function (`lif_step`)
-- **`synapses.py`** → Defines `SynapseProj` class for handling delays, weights, conductances
-- **`inputs.py`** → Generates PF coinflip spikes and MF Poisson spikes
-- **`coupling.py`** → Computes IO gap-junction currents
-- **`plasticity.py`** → Applies PF→PKJ LTP/LTD learning rules
-- **`recorder.py`** → Records spikes, weights, and timing; saves results to `.npz`
-- **`analysis.py`** → Loads `.npz` and produces publication-ready plots
-- **`test_analysis_performance.py`** → Performance testing script for analysis
+3. **`neurons.py`** — the neuron models themselves.
+   - `NeuronState` + `lif_step`: the plain LIF neuron used by PKJ and DCN.
+   - `IOState` + `io_step`: the IO pacemaker neuron (decaying threshold, gap
+     current, noise-driven spontaneous firing).
 
-## ▶️ How to Run
+4. **`coupling.py`** — the IO↔IO gap junction current. Given a pair of coupled
+   neurons, current flows between them proportional to their voltage
+   difference — this is separate from synapses, no spikes involved.
 
-### Prerequisites
-- NVIDIA GPU with CUDA support
-- Python 3.8+ with CuPy, NumPy, Matplotlib
-- Optional: Numba for faster analysis (automatically used if available)
+5. **`synapses.py`** — the `Synapse` class used for every synaptic connection
+   (PF→PKJ, IO→PKJ, PKJ→DCN, DCN→IO). On a presynaptic spike, conductance jumps
+   and then decays exponentially; postsynaptic current is
+   `conductance × (reversal_potential − postsynaptic_voltage)`, which is what
+   makes a synapse excitatory or inhibitory. Each connection type also has a
+   fixed transmission delay.
 
-### Running the Simulation
-1. Run the simulation:
-   ```bash
-   python3 main.py
-   ```
-   This will create `cbm_py_output.npz` with all simulation data.
+6. **`plasticity.py`** — the learning rule for PF→PKJ weights. Every PF fiber's
+   recent spike history is tracked in a ring buffer split into two windows: the
+   last 10ms counts toward depression (LTD), the 90ms before that counts toward
+   potentiation (LTP), with LTD weighted 9x stronger per spike. Weights only
+   update at the instant an IO cell fires. Because the window split (1:9) and
+   strength ratio (9:1) are reciprocal, random uncorrelated PF activity produces
+   zero net weight drift — only PF activity correlated with IO firing actually
+   moves the weights.
 
-2. Analyze the results:
-   ```bash
-   python3 analysis.py
-   ```
-   This will create `analysis_outputs/` directory with publication-ready plots.
+7. **`inputs.py`** — small helpers: Poisson spike generation for PF, and random
+   draws for per-synapse conductance values.
 
-### Configuration
-All parameters are centralized in `config.py`. Key settings include:
-- `T_sec`: Simulation duration (default: 1000 seconds)
-- `dt`: Time step (default: 0.1 ms)
-- Population sizes (IO, PKJ, BC, DCN, PF, MF)
-- Neuron parameters (capacitance, conductance, thresholds)
-- Synaptic properties (delays, decay constants, weights)
-- Plasticity rules (LTP/LTD windows and scales)
+8. **`recorder.py`** — bins spikes from every population over the course of the
+   run and saves everything (plus weight trajectories) to a single `.npz` file
+   at the end.
 
-<img width="2579" height="1771" alt="SIM_DIAGRAM" src="https://github.com/user-attachments/assets/8069243c-2711-409e-a006-13160d92dfe2" />
+9. **`simulate.py`** — ties everything above together. `run()` builds the
+   populations, connectivity, and synapses from `config.py`, then loops one
+   timestep at a time: draw PF spikes → PF+IO current into PKJ → step PKJ →
+   PKJ current into DCN → step DCN → DCN current + gap junctions + noise into
+   IO → step IO → update PF→PKJ weights from this step's IO spikes → record.
+   This is the file to read to see the actual step-by-step control flow.
+
+10. **`analysis.py`** — loads the saved `.npz` and plots spike rasters per
+    population and the PF→PKJ weight trajectory over time.
+
+11. **`main.py`** — the entry point. Checks a CUDA GPU is available, then calls
+    `simulate.run()`.
+
+## Running it
+
+```bash
+python3 main.py       # runs the simulation, saves cbm_py_output.npz
+python3 analysis.py   # loads that file, produces raster/weight plots
+```
+
+or `./run_simulation.sh` to do both. `./clean_outputs.sh` deletes generated
+output files (`cbm_py_output.npz`, plot directories) to reset to a clean state.
+
+## Reading the output
+
+- **Rasters** (one per population) — each dot is a spike; a healthy run shows
+  PF firing at its fixed background rate, PKJ firing at a moderate rate shaped
+  by PF input and IO inhibition, DCN firing steadily except when suppressed by
+  PKJ, and IO firing sparsely (~1 Hz) and roughly evenly across cells.
+- **Weight trajectory** — the mean and spread of PF→PKJ weights over time.
+  A stable run keeps the mean roughly flat (no runaway drift) while individual
+  weights still spread out from learning.
